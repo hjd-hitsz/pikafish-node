@@ -1,0 +1,171 @@
+name: Build and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  network:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - run: bash scripts/fetch-network.sh
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: nnue
+          path: vendor/
+          compression-level: 0
+          if-no-files-found: error
+
+  engine:
+    needs: network
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-22.04
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: darwin-arm64
+            runner: macos-15
+          - target: win32-x64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: nnue
+          path: vendor
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: CLANG64
+          install: mingw-w64-clang-x86_64-clang make
+      - name: Build Pikafish
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/build-engine.sh '${{ matrix.target }}'
+      - name: Build Pikafish on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash scripts/build-engine.sh win32-x64
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - run: npm test
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.target }}
+          path: vendor/${{ matrix.target }}/
+          if-no-files-found: error
+
+  package:
+    needs: engine
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: nnue
+          path: vendor
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: '*-*'
+          path: vendor
+      - name: Pack native engines and corresponding source
+        shell: bash
+        run: |
+          if [[ $GITHUB_REF_TYPE == tag ]]; then
+            test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
+          fi
+          chmod +x vendor/*/pikafish
+          cp upstream/Pikafish/{AUTHORS,Copying.txt} vendor/
+          git -C upstream/Pikafish archive --prefix=upstream/Pikafish/ HEAD > "$RUNNER_TEMP/pikafish-source.tar"
+          tar -rf "$RUNNER_TEMP/pikafish-source.tar" scripts/build-engine.sh scripts/fetch-network.sh
+          gzip -n -c "$RUNNER_TEMP/pikafish-source.tar" > vendor/pikafish-source.tar.gz
+          tarball=$(npm pack --quiet)
+          mv "$tarball" pikafish-node.tgz
+      - name: Install and run the packed release
+        shell: bash
+        run: |
+          tarball="$PWD/pikafish-node.tgz"
+          cd "$(mktemp -d)"
+          npm install --offline --ignore-scripts --no-audit --no-fund "$tarball"
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { createEngine } from 'pikafish-node';
+          const engine = await createEngine();
+          try {
+            assert.match((await engine.analyze({ depth: 5 })).bestMove, /^[a-i][0-9][a-i][0-9]$/);
+          } finally {
+            await engine.close();
+          }
+          JS
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: npm-package
+          path: pikafish-node.tgz
+          compression-level: 0
+          if-no-files-found: error
+
+  github-release:
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-package
+      - name: Publish the installable npm tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fxq pikafish-node.tgz; then
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" pikafish-node.tgz --verify-tag --generate-notes
+
+  npm-release:
+    if: github.ref_type == 'tag' && vars.NPM_TRUSTED_PUBLISHING == 'true'
+    needs: github-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-package
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm publish ./pikafish-node.tgz --access public

@@ -1,0 +1,22 @@
+{
+  "name": "pikafish-node",
+  "version": "0.1.0",
+  "description": "Pikafish Xiangqi analysis for Node.js, with the native engine and NNUE included.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hjd-hitsz/pikafish-node.git"
+  },
+  "bugs": { "url": "https://github.com/hjd-hitsz/pikafish-node/issues" },
+  "keywords": ["xiangqi", "chinese-chess", "pikafish", "uci", "nnue"],
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    "types": "./src/index.d.ts",
+    "default": "./src/index.js"
+  },
+  "engines": { "node": ">=22" },
+  "files": ["src", "vendor", "THIRD_PARTY_NOTICES.md"],
+  "scripts": { "test": "node --test" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" }
+}
