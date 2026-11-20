@@ -115,16 +115,13 @@ jobs:
           tarball="$PWD/pikafish-node.tgz"
           cd "$(mktemp -d)"
           npm install --offline --ignore-scripts --no-audit --no-fund "$tarball"
-          node --input-type=module <<'JS'
-          import assert from 'node:assert/strict';
-          import { createEngine } from 'pikafish-node';
-          const engine = await createEngine();
-          try {
-            assert.match((await engine.analyze({ depth: 5 })).bestMove, /^[a-i][0-9][a-i][0-9]$/);
-          } finally {
-            await engine.close();
-          }
-          JS
+          cli=./node_modules/.bin/pikafish-node
+          fen='rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1'
+          "$cli" search "$fen" --depth 5 --nodes 1000 --searchmove h2e2 --json | jq -e '.bestMove == "h2e2"'
+          printf '%s\n' "$fen" | "$cli" inspect --json | jq -e '(.legal | length) == 44'
+          printf '%s\n' uci isready 'position startpos' 'go perft 1' quit | "$cli" uci > session.log
+          grep -Fx 'uciok' session.log
+          grep -Fx 'Nodes searched: 44' session.log
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: npm-package

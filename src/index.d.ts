@@ -5,16 +5,25 @@ export interface EngineOptions {
 }
 
 type SearchLimit =
-  | { depth?: number; nodes?: never; movetimeMs?: never }
-  | { depth?: never; nodes: number; movetimeMs?: never }
+  | { depth?: number; nodes?: number; movetimeMs?: never }
   | { depth?: never; nodes?: never; movetimeMs: number };
 
-export type AnalysisOptions = SearchLimit & {
+export interface PositionOptions {
   fen?: string;
   moves?: readonly string[];
-  multiPv?: number;
   timeoutMs?: number;
+}
+
+export type AnalysisOptions = SearchLimit & PositionOptions & {
+  multiPv?: number;
+  searchMoves?: readonly string[];
 };
+
+export interface PositionState {
+  fen: string;
+  checkers: string[];
+  legal: string[];
+}
 
 export interface AnalysisLine {
   rank: number;
@@ -30,13 +39,17 @@ export interface AnalysisLine {
 export interface AnalysisResult {
   bestMove: string | null;
   ponder: string | null;
+  completeDepth: number | null;
   lines: AnalysisLine[];
 }
 
 export interface Pikafish {
   readonly name: string;
+  inspect(options?: PositionOptions): Promise<PositionState>;
   analyze(options?: AnalysisOptions): Promise<AnalysisResult>;
   close(): Promise<void>;
 }
 
 export function createEngine(options?: EngineOptions): Promise<Pikafish>;
+export function runUci(args: readonly string[]): Promise<number>;
+export function engineHashes(): Promise<{ binary_sha256: string; nnue_sha256: string }>;

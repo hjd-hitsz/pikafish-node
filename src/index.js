@@ -1,4 +1,6 @@
 const { spawn } = require('node:child_process');
+const { createHash } = require('node:crypto');
+const { createReadStream } = require('node:fs');
 const { access } = require('node:fs/promises');
 const { join } = require('node:path');
 const { createInterface } = require('node:readline');
@@ -16,10 +18,14 @@ function integer(name, value, max) {
   return value;
 }
 
-function positionCommand(fen, moves) {
+function validateMoves(name, moves) {
   if (!Array.isArray(moves) || moves.some(move => typeof move !== 'string' || move.length !== 4 || !MOVE.test(move))) {
-    throw new TypeError('moves must be an array of Xiangqi coordinates, such as h2e2');
+    throw new TypeError(`${name} must be an array of Xiangqi coordinates, such as h2e2`);
   }
+}
+
+function positionCommand(fen, moves) {
+  validateMoves('moves', moves);
 
   let position = 'position startpos';
   if (fen !== undefined) {
@@ -37,12 +43,18 @@ function positionCommand(fen, moves) {
   return moves.length ? `${position} moves ${moves.join(' ')}` : position;
 }
 
-function searchCommand({ depth, nodes, movetimeMs }) {
-  const limits = [depth, nodes, movetimeMs].filter(value => value !== undefined);
-  if (limits.length > 1) throw new TypeError('Choose one of depth, nodes, or movetimeMs');
-  if (nodes !== undefined) return `go nodes ${integer('nodes', nodes, Number.MAX_SAFE_INTEGER)}`;
-  if (movetimeMs !== undefined) return `go movetime ${integer('movetimeMs', movetimeMs, 3_600_000)}`;
-  return `go depth ${integer('depth', depth ?? 12, 128)}`;
+function searchCommand({ depth, nodes, movetimeMs, searchMoves = [] }) {
+  validateMoves('searchMoves', searchMoves);
+  if (movetimeMs !== undefined && (depth !== undefined || nodes !== undefined)) {
+    throw new TypeError('Use movetimeMs on its own, or combine depth and nodes');
+  }
+  const command = ['go'];
+  if (depth !== undefined) command.push('depth', integer('depth', depth, 128));
+  if (nodes !== undefined) command.push('nodes', integer('nodes', nodes, Number.MAX_SAFE_INTEGER));
+  if (movetimeMs !== undefined) command.push('movetime', integer('movetimeMs', movetimeMs, 3_600_000));
+  if (command.length === 1) command.push('depth', 12);
+  if (searchMoves.length) command.push('searchmoves', ...searchMoves);
+  return command.join(' ');
 }
 
 function searchInfo(line) {
@@ -141,14 +153,44 @@ class EngineSession {
   }
 }
 
+async function engineFiles() {
+  const target = `${process.platform}-${process.arch}`;
+  if (!SUPPORTED_TARGETS.has(target)) throw new Error(`Pikafish does not support ${target}`);
+  const binary = join(VENDOR_DIR, target, process.platform === 'win32' ? 'pikafish.exe' : 'pikafish');
+  const network = join(VENDOR_DIR, 'pikafish.nnue');
+  await Promise.all([access(binary), access(network)]);
+  return { binary, network };
+}
+
+async function runUci(args) {
+  const { binary } = await engineFiles();
+  const child = spawn(binary, args, { cwd: VENDOR_DIR, stdio: 'inherit', windowsHide: true });
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => {
+      if (signal) reject(new Error(`Pikafish received ${signal}`));
+      else resolve(code);
+    });
+  });
+}
+
+async function sha256(file) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+async function engineHashes() {
+  const { binary, network } = await engineFiles();
+  const [binary_sha256, nnue_sha256] = await Promise.all([sha256(binary), sha256(network)]);
+  return { binary_sha256, nnue_sha256 };
+}
+
 async function createEngine({ threads = 1, hashMb = 16, startupTimeoutMs = 15_000 } = {}) {
   integer('threads', threads, 128);
   integer('hashMb', hashMb, 4096);
   integer('startupTimeoutMs', startupTimeoutMs, 2_147_483_647);
-  const target = `${process.platform}-${process.arch}`;
-  if (!SUPPORTED_TARGETS.has(target)) throw new Error(`Pikafish does not support ${target}`);
-  const binary = join(VENDOR_DIR, target, process.platform === 'win32' ? 'pikafish.exe' : 'pikafish');
-  await Promise.all([access(binary), access(join(VENDOR_DIR, 'pikafish.nnue'))]);
+  const { binary } = await engineFiles();
 
   const session = new EngineSession(binary);
   let name = 'Pikafish';
@@ -169,12 +211,32 @@ async function createEngine({ threads = 1, hashMb = 16, startupTimeoutMs = 15_00
 
   return {
     name,
+    async inspect({ fen, moves = [], timeoutMs = 30_000 } = {}) {
+      integer('timeoutMs', timeoutMs, 2_147_483_647);
+      const position = positionCommand(fen, moves);
+      const state = { fen: '', checkers: [], legal: [] };
+      let total;
+      return session.exchange([position, 'd', 'go perft 1', 'isready'], line => {
+        if (line.startsWith('Fen: ')) state.fen = line.slice(5);
+        if (line.startsWith('Checkers:')) state.checkers = line.slice(9).trim().split(/\s+/).filter(Boolean).sort();
+        const legalMove = /^([a-i][0-9][a-i][0-9]): 1$/.exec(line);
+        if (legalMove) state.legal.push(legalMove[1]);
+        if (line.startsWith('Nodes searched: ')) total = Number(line.slice(16));
+        if (line === 'readyok') return true;
+      }, timeoutMs).then(() => {
+        if (!state.fen || state.legal.length !== total) throw new Error('Incomplete Pikafish position report');
+        state.legal.sort();
+        return state;
+      });
+    },
     async analyze({ fen, moves = [], multiPv = 1, timeoutMs = 30_000, ...limits } = {}) {
       integer('multiPv', multiPv, 128);
       integer('timeoutMs', timeoutMs, 2_147_483_647);
       const position = positionCommand(fen, moves);
       const search = searchCommand(limits);
       const lines = new Map();
+      const iterations = new Map();
+      let complete = [];
 
       return session.exchange([
         'ucinewgame',
@@ -188,11 +250,22 @@ async function createEngine({ threads = 1, hashMb = 16, startupTimeoutMs = 15_00
           return {
             bestMove: MOVE.test(move) ? move : null,
             ponder: MOVE.test(ponder ?? '') ? ponder : null,
-            lines: [...lines.values()].sort((a, b) => a.rank - b.rank),
+            completeDepth: complete[0]?.depth ?? null,
+            lines: complete.length ? complete : [...lines.values()].sort((a, b) => a.rank - b.rank),
           };
         }
         const info = searchInfo(line);
-        if (info) lines.set(info.rank, info);
+        if (!info) return;
+        lines.set(info.rank, info);
+        if (info.score.bound || !info.pv.length) return;
+        const key = `${info.depth}:${info.nodes}`;
+        const iteration = iterations.get(key) ?? new Map();
+        iteration.set(info.rank, info);
+        iterations.set(key, iteration);
+        if (iteration.size === multiPv && info.depth >= (complete[0]?.depth ?? 0)) {
+          const ranked = [...iteration.values()].sort((a, b) => a.rank - b.rank);
+          if (new Set(ranked.map(entry => entry.pv[0])).size === multiPv) complete = ranked;
+        }
       }, timeoutMs);
     },
     close: () => session.close(),
@@ -200,3 +273,5 @@ async function createEngine({ threads = 1, hashMb = 16, startupTimeoutMs = 15_00
 }
 
 exports.createEngine = createEngine;
+exports.runUci = runUci;
+exports.engineHashes = engineHashes;
